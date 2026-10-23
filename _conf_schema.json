@@ -66,6 +66,12 @@
     "type": "int",
     "default": 30
   },
+  "worker_idle_timeout": {
+    "description": "后台发送队列空闲回收时间（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "队列长时间无新任务时后台 worker 自动退出，节省资源；下次选择文件会自动重建，不影响使用"
+  },
   "baidu_cookie": {
     "description": "百度网盘 Cookie",
     "type": "string",

@@ -1,3 +1,17 @@
+"""网盘直链解析插件。
+
+移植自 LinkSwift（https://github.com/hmjz100/LinkSwift）的取链思路，
+在 AstrBot 中实现：
+
+1. 用正则识别聊天中的网盘分享链接；
+2. 通过 `_conf_schema.json` 中配置的 Cookie / Token 调用各网盘接口获取文件直链；
+3. 支持在分享内逐层进入 / 返回文件夹浏览；
+4. 分享或目录内存在多个文件时，把列表发回会话，由用户回复序号选择；
+5. 通过 OneBot（aiocqhttp）把文件发送出去。
+
+注意：各网盘的非公开接口随时可能变化，解析失败时会返回具体错误信息。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,8 +28,8 @@ from typing import Any
 import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import File
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import File, Plain
 from astrbot.api.star import Context, Star
 
 # ---------------------------------------------------------------------------
@@ -74,19 +88,28 @@ UA_UC = (
 )
 
 
+# 结束浏览的关键词
+CLOSE_WORDS = {"关闭", "取消", "q"}
+
+# 返回上级的关键词
+UP_WORDS = {"..", "返回"}
+
+
 class PanError(Exception):
     """网盘接口调用失败。"""
 
 
 @dataclass
 class PanFile:
-    """统一的文件条目。"""
+    """统一的文件 / 文件夹条目。"""
 
     name: str
     size: int = 0
     is_dir: bool = False
     file_id: str = ""
-    # 各网盘获取直链所需的附加信息
+    # 进入该目录时使用的引用值（各网盘不同：路径 / file_id / fid 等）
+    dir_ref: str = ""
+    # 网盘上下文（shareid、stoken、cookie 等），供 _link_* 使用
     extra: dict[str, Any] = field(default_factory=dict)
     link: str = ""
 
@@ -97,13 +120,38 @@ class PanFile:
 
 @dataclass
 class PendingShare:
-    """等待用户选择的分享。"""
+    """等待用户浏览 / 选择的分享会话。"""
 
     pan: str
+    raw_url: str
     share_id: str
     pwd: str
+    ctx: dict[str, Any]
+    # 目录栈：[("根目录", root_ref), ("子目录", child_ref), ...]
+    stack: list[tuple[str, str]]
     files: list[PanFile]
+    umo: str = ""
     created_at: float = field(default_factory=time.time)
+
+    @property
+    def current_ref(self) -> str:
+        return self.stack[-1][1]
+
+    @property
+    def path_text(self) -> str:
+        if len(self.stack) <= 1:
+            return "/"
+        return "/" + "/".join(name for name, _ in self.stack[1:])
+
+    @property
+    def path_display(self) -> str:
+        """带结尾斜杠的展示路径，如 `/`、`/电影/`。"""
+        text = self.path_text
+        return text if text.endswith("/") else text + "/"
+
+    @property
+    def root_ref(self) -> str:
+        return self.stack[0][1]
 
 
 def human_size(size: int | float | str) -> str:
@@ -139,7 +187,6 @@ def extract_links(text: str) -> list[tuple[str, str, str, str]]:
     Returns:
         [(pan, raw_url, share_id, pwd), ...]
     """
-    # 链接外单独给出的提取码（整段文本共用一个）
     fallback_pwd = ""
     fallback_match = re.search(PWD_TEXT_PATTERN, text)
     if fallback_match:
@@ -153,14 +200,13 @@ def extract_links(text: str) -> list[tuple[str, str, str, str]]:
             share_id = match.group(1)
             pwd = ""
             if pwd_pattern:
-                # 提取码通常跟在链接后面的查询参数里，因此在整段文本中查找
                 pwd_match = re.search(pwd_pattern, text)
                 if pwd_match:
                     pwd = pwd_match.group(1)
             if not pwd:
                 pwd = fallback_pwd
             results.append((pan, raw_url, share_id, pwd))
-    # 去重
+
     seen: set[tuple[str, str]] = set()
     unique: list[tuple[str, str, str, str]] = []
     for item in results:
@@ -184,6 +230,10 @@ class PanLinkPlugin(Star):
         self._pending: dict[str, PendingShare] = {}
         # unified_msg_origin -> asyncio.Lock
         self._locks: dict[str, asyncio.Lock] = {}
+        # unified_msg_origin -> 待发送文件队列（后台下载，不阻塞浏览）
+        self._queues: dict[str, asyncio.Queue] = {}
+        # unified_msg_origin -> 后台发送 worker
+        self._workers: dict[str, asyncio.Task] = {}
         self._temp_dir = Path(tempfile.gettempdir()) / "astrbot_pan_link"
         self._temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -195,6 +245,11 @@ class PanLinkPlugin(Star):
         await self.cleanup_temp_files()
 
     async def terminate(self) -> None:
+        for task in self._workers.values():
+            if not task.done():
+                task.cancel()
+        self._workers.clear()
+        self._queues.clear()
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -285,6 +340,11 @@ class PanLinkPlugin(Star):
         except aiohttp.ClientError as exc:
             raise PanError(f"网络请求失败：{exc}") from exc
 
+    @staticmethod
+    def _cookie_has(cookie: str, *keys: str) -> bool:
+        """判断 Cookie 串中是否包含指定键。"""
+        return all(re.search(rf"(?:^|;\s*){re.escape(key)}=", cookie) for key in keys)
+
     # ------------------------------------------------------------------
     # 入口 1：正则识别分享链接
     # ------------------------------------------------------------------
@@ -321,7 +381,6 @@ class PanLinkPlugin(Star):
             return
 
         async with lock:
-            # 不 stop_event，否则后续 yield 的结果会被流水线丢弃
             event.should_call_llm(False)
             pan, raw_url, share_id, pwd = links[0]
             pan_name = PAN_NAMES.get(pan, pan)
@@ -330,7 +389,9 @@ class PanLinkPlugin(Star):
             )
 
             try:
-                files = await self._resolve_files(pan, raw_url, share_id, pwd)
+                ctx, files, root_ref = await self._open_share(
+                    pan, raw_url, share_id, pwd
+                )
             except PanError as exc:
                 yield event.plain_result(f"解析失败：{exc}")
                 return
@@ -339,35 +400,52 @@ class PanLinkPlugin(Star):
                 yield event.plain_result(f"解析失败：{exc}")
                 return
 
-            files = [f for f in files if not f.is_dir]
-            if not files:
-                yield event.plain_result("分享中没有可下载的文件。")
+            visible = [f for f in files if f.name and f.name != "."]
+            if not visible:
+                yield event.plain_result("分享为空或没有可访问的内容。")
                 return
 
-            if len(files) == 1 and bool(self._cfg("auto_send_single", True)):
-                yield event.plain_result("已获取到文件，正在发送...")
-                async for result in self._send_files(event, pan, files):
-                    yield result
+            regular = [f for f in visible if not f.is_dir]
+            has_dir = any(f.is_dir for f in visible)
+            if len(regular) == 1 and not has_dir and bool(
+                self._cfg("auto_send_single", True)
+            ):
+                await self._queue_files(event, pan, regular)
+                yield event.plain_result("已获取到文件，正在后台发送...")
                 return
 
-            # 多文件：记录待选择状态并展示列表
-            self._pending[umo] = PendingShare(
+            # 新的分享开始，旧的浏览会话与待发送队列一并清空
+            self._clear_queue(umo)
+            self._clear_queue(umo)
+            pending = PendingShare(
                 pan=pan,
+                raw_url=raw_url,
                 share_id=share_id,
                 pwd=pwd,
-                files=files,
+                ctx=ctx,
+                stack=[("根目录", root_ref)],
+                files=visible,
+                umo=umo,
             )
-            yield event.plain_result(self._format_file_list(pan, files))
+            self._pending[umo] = pending
+            yield event.plain_result(self._render_listing(pending))
 
     # ------------------------------------------------------------------
-    # 入口 2：用户选择文件
+    # 入口 2：选择文件 / 文件夹导航
     # ------------------------------------------------------------------
 
     @filter.regex(
-        r"^\s*(?:[0-9]+(?:[\s,，、~\-]+[0-9]+)*|all|ALL|All|全部|全选|\*)\s*$"
+        r"^\s*(?:"
+        r"(?i:cd\s*\d+|进入\s*\d+|\d+/)"
+        r"|\.\.|(?i:cd\s*\.\.|返回|上级|上一级|back)"
+        r"|(?i:p|ls|pwd|路径)"
+        r"|(?i:关闭|close|exit|quit|结束|取消|q)"
+        r"|[0-9]+(?:[\s,，、~\-]+[0-9]+)*"
+        r"|(?i:all|全部|全选|\*)"
+        r")\s*$"
     )
     async def on_select_files(self, event: AstrMessageEvent):
-        """用户回复序号（支持 1 2 3 / 1,2,3 / 1-3 / all）。"""
+        """序号进入文件夹或下载文件；.. 返回上级；关闭 结束浏览。"""
         umo = event.unified_msg_origin
         pending = self._pending.get(umo)
         if not pending:
@@ -376,21 +454,108 @@ class PanLinkPlugin(Star):
         timeout = int(self._cfg("selection_timeout", 180) or 180)
         if time.time() - pending.created_at > timeout:
             self._pending.pop(umo, None)
-            yield event.plain_result("选择已超时，请重新发送分享链接。")
+            self._clear_queue(umo)
+            yield event.plain_result("浏览已超时，会话已结束。请重新发送分享链接。")
             return
 
         event.should_call_llm(False)
         text = event.get_message_str().strip()
-        indexes = self._parse_selection(text, len(pending.files))
-        if not indexes:
-            yield event.plain_result("序号无效，请回复列表中的数字，或回复 all 选择全部。")
+        low = text.lower()
+
+        # 关闭浏览
+        if low in CLOSE_WORDS:
+            self._pending.pop(umo, None)
+            pending_count = self._clear_queue(umo)
+            if pending_count:
+                yield event.plain_result(
+                    f"已关闭浏览，并取消 {pending_count} 个待发送文件。"
+                )
+            else:
+                yield event.plain_result("已关闭浏览。")
             return
 
-        self._pending.pop(umo, None)
-        selected = [pending.files[i] for i in indexes]
-        yield event.plain_result(f"已选择 {len(selected)} 个文件，开始发送...")
-        async for result in self._send_files(event, pending.pan, selected):
-            yield result
+        # 查看路径
+        if low in {"p", "ls", "pwd", "路径"}:
+            pending.created_at = time.time()
+            yield event.plain_result(self._render_listing(pending))
+            return
+
+        # 返回上级
+        if low in UP_WORDS:
+            if len(pending.stack) <= 1:
+                pending.created_at = time.time()
+                yield event.plain_result(
+                    "已经在根目录了。\n\n" + self._render_listing(pending)
+                )
+                return
+            popped = pending.stack.pop()
+            try:
+                files = await self._list_dir(
+                    pending.pan, pending.ctx, pending.current_ref
+                )
+            except PanError as exc:
+                pending.stack.append(popped)
+                yield event.plain_result(f"返回上级失败：{exc}")
+                return
+            pending.files = [f for f in files if f.name and f.name != "."]
+            pending.created_at = time.time()
+            yield event.plain_result(self._render_listing(pending))
+            return
+
+        # 解析序号：目录则进入，文件则下载
+        indexes = self._parse_selection(text, len(pending.files))
+        if not indexes:
+            yield event.plain_result(
+                "输入无效。回复序号进入文件夹或下载文件，.. 返回上级，关闭 结束浏览。"
+            )
+            return
+
+        # 单个序号且命中文件夹 -> 进入
+        if len(indexes) == 1:
+            target = pending.files[indexes[0]]
+            if target.is_dir:
+                try:
+                    files = await self._list_dir(
+                        pending.pan, pending.ctx, target.dir_ref
+                    )
+                except PanError as exc:
+                    yield event.plain_result(f"进入文件夹失败：{exc}")
+                    return
+                visible = [f for f in files if f.name and f.name != "."]
+                if not visible:
+                    pending.created_at = time.time()
+                    yield event.plain_result(
+                        f"「{target.name}」是空文件夹。\n\n"
+                        + self._render_listing(pending)
+                    )
+                    return
+                pending.stack.append((target.name, target.dir_ref))
+                pending.files = visible
+                pending.created_at = time.time()
+                yield event.plain_result(self._render_listing(pending))
+                return
+
+        # 下载选中的文件（文件夹自动跳过），发送后保留浏览状态
+        selected = [pending.files[i] for i in indexes if not pending.files[i].is_dir]
+        skipped = [pending.files[i].name for i in indexes if pending.files[i].is_dir]
+
+        if not selected:
+            yield event.plain_result(
+                "选中的都是文件夹，请输入单个序号进入，或 .. 返回上级。"
+            )
+            return
+
+        await self._queue_files(event, pending.pan, selected)
+
+        msg = f"已加入发送队列：{len(selected)} 个文件（后台下载，不阻塞浏览）"
+        if skipped:
+            msg += f"（跳过文件夹：{'、'.join(skipped)}）"
+        msg += (
+            f"\n当前仍在 {pending.path_display}，可继续进入其它文件夹，"
+            "或输入 .. 返回上级，关闭 结束浏览。"
+        )
+        pending.created_at = time.time()
+        yield event.plain_result(msg)
 
     @staticmethod
     def _parse_selection(text: str, total: int) -> list[int]:
@@ -418,65 +583,168 @@ class PanLinkPlugin(Star):
                 valid.append(index)
         return valid
 
-    def _format_file_list(self, pan: str, files: list[PanFile]) -> str:
-        lines = [
-            f"共找到 {len(files)} 个文件（{PAN_NAMES.get(pan, pan)}）：",
-        ]
-        for index, item in enumerate(files, start=1):
-            lines.append(f"{index}. {item.name}（{item.size_text}）")
+    def _render_listing(self, pending: PendingShare) -> str:
+        """渲染目录列表：标题 + 序号条目 + 返回/关闭项 + 操作提示。
+
+        形如::
+
+            目录:/
+            1. 📂 x1
+            2. 📂 x2
+            3. 📄 x3（1.24 KB）
+            ❌关闭
+
+            ▸ 输入序号进入文件夹或下载文件；输入 .. 返回上级；输入 关闭 结束浏览
+        """
+        lines = [f"目录:{pending.path_display}"]
+
+        # 返回上级项（非根目录才显示）
+        if len(pending.stack) > 1:
+            lines.append("↩  ..")
+
+        for index, item in enumerate(pending.files, start=1):
+            if item.is_dir:
+                lines.append(f"{index}. 📂 {item.name}")
+            else:
+                lines.append(f"{index}. 📄 {item.name}（{item.size_text}）")
+
+        lines.append("❌关闭")
         lines.append("")
-        lines.append("回复序号选择文件，支持 1 2 3 / 1,2,3 / 1-3，回复 all 选择全部。")
+
+        tips = ["输入序号进入文件夹或下载文件"]
+        if len(pending.stack) > 1:
+            tips.append("输入 .. 返回上级")
+        tips.append("输入 关闭 结束浏览")
+
+        queue = self._queues.get(pending.umo)
+        pending_count = queue.qsize() if queue is not None else 0
+        if pending_count:
+            tips.append(f"后台队列剩余 {pending_count} 个")
+        lines.append("▸ " + "；".join(tips))
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # 发送文件
     # ------------------------------------------------------------------
 
-    async def _send_files(self, event: AstrMessageEvent, pan: str, files: list[PanFile]):
-        """下载并通过 OneBot 发送文件。"""
+    def _ensure_worker(self, umo: str) -> asyncio.Queue:
+        """取得（必要时创建）该会话的发送队列与后台 worker。"""
+        queue = self._queues.get(umo)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._queues[umo] = queue
+
+        task = self._workers.get(umo)
+        if task is None or task.done():
+            self._workers[umo] = asyncio.create_task(self._send_worker(umo, queue))
+        return queue
+
+    async def _queue_files(
+        self, event: AstrMessageEvent, pan: str, files: list[PanFile]
+    ):
+        """把文件加入后台发送队列，立即返回；不会阻塞当前浏览。"""
+        umo = event.unified_msg_origin
+        queue = self._ensure_worker(umo)
+        for item in files:
+            queue.put_nowait((umo, pan, item))
+        return len(files)
+
+    def _clear_queue(self, umo: str) -> int:
+        """取消该会话的后台 worker 与排队任务，返回被取消的任务数。"""
+        count = 0
+        queue = self._queues.pop(umo, None)
+        if queue is not None:
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                    queue.task_done()
+                    count += 1
+                except asyncio.QueueEmpty:
+                    break
+        task = self._workers.pop(umo, None)
+        if task is not None and not task.done():
+            task.cancel()
+        return count
+
+    async def _send_worker(self, umo: str, queue: asyncio.Queue) -> None:
+        """后台依次下载并发送队列中的文件。
+
+        浏览与下载解耦：用户可以在下载过程中继续进入其它文件夹、添加新的下载任务。
+        队列空闲超过 `worker_idle_timeout` 秒后自动退出，避免常驻占用。
+        """
+        idle = max(30, int(self._cfg("worker_idle_timeout", 300) or 300))
+        while True:
+            try:
+                umo, pan, item = await asyncio.wait_for(queue.get(), timeout=idle)
+            except asyncio.TimeoutError:
+                # 长时间无任务，退出 worker（队列对象保留，下次入队会重建 worker）
+                if self._workers.get(umo) is asyncio.current_task():
+                    self._workers.pop(umo, None)
+                return
+            except asyncio.CancelledError:
+                raise
+            try:
+                await self._deliver_one(umo, pan, item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("后台发送文件失败：%s", item.name)
+            finally:
+                queue.task_done()
+
+    async def _deliver_one(self, umo: str, pan: str, item: PanFile) -> None:
+        """下载单个文件并通过 OneBot 发送。"""
         send_mode = str(self._cfg("send_mode", "download") or "download").lower()
         limit_mb = int(self._cfg("max_file_size_mb", 0) or 0)
         limit_bytes = limit_mb * 1024 * 1024 if limit_mb > 0 else 0
 
-        for item in files:
-            if limit_bytes and item.size and item.size > limit_bytes:
-                yield event.plain_result(
-                    f"{item.name} 超过大小限制（{human_size(limit_bytes)}），"
-                    f"直链：{item.link or '未获取'}"
-                )
-                continue
+        if limit_bytes and item.size and item.size > limit_bytes:
+            await self._push_text(
+                umo,
+                f"⚠️ {item.name} 超过大小限制（{human_size(limit_bytes)}），"
+                f"直链：{item.link or '未获取'}",
+            )
+            return
 
-            if not item.link:
-                try:
-                    item.link = await self._resolve_file_link(pan, item)
-                except PanError as exc:
-                    yield event.plain_result(f"{item.name} 获取直链失败：{exc}")
-                    continue
-
-            if not item.link:
-                yield event.plain_result(f"{item.name} 获取直链失败。")
-                continue
-
-            filename = safe_filename(item.name)
-
-            if send_mode == "url":
-                yield event.chain_result([File(name=filename, url=item.link)])
-                continue
-
+        if not item.link:
             try:
-                local_path = await self._download_file(pan, item.link, filename)
+                item.link = await self._resolve_file_link(pan, item)
             except PanError as exc:
-                yield event.plain_result(f"{item.name} 下载失败：{exc}")
-                continue
+                await self._push_text(umo, f"❌ {item.name} 获取直链失败：{exc}")
+                return
 
-            track = getattr(event, "track_temporary_local_file", None)
-            if callable(track):
-                try:
-                    track(local_path)
-                except Exception:  # noqa: BLE001
-                    logger.debug("track_temporary_local_file 调用失败", exc_info=True)
+        if not item.link:
+            await self._push_text(umo, f"❌ {item.name} 获取直链失败。")
+            return
 
-            yield event.chain_result([File(name=filename, file=local_path)])
+        filename = safe_filename(item.name)
+
+        if send_mode == "url":
+            await self._push_chain(umo, [File(name=filename, url=item.link)])
+            return
+
+        await self._push_text(umo, f"⬇️ 正在下载：{item.name}（{item.size_text}）")
+        try:
+            local_path = await self._download_file(pan, item.link, filename)
+        except PanError as exc:
+            await self._push_text(umo, f"❌ {item.name} 下载失败：{exc}")
+            return
+
+        await self._push_chain(umo, [File(name=filename, file=local_path)])
+
+    async def _push_text(self, umo: str, text: str) -> None:
+        """主动向会话发送文本。"""
+        try:
+            await self.context.send_message(umo, MessageChain([Plain(text)]))
+        except Exception:  # noqa: BLE001
+            logger.exception("主动发送消息失败")
+
+    async def _push_chain(self, umo: str, chain: list) -> None:
+        """主动向会话发送消息链。"""
+        try:
+            await self.context.send_message(umo, MessageChain(chain))
+        except Exception:  # noqa: BLE001
+            logger.exception("主动发送文件失败")
 
     async def _download_file(self, pan: str, url: str, filename: str) -> str:
         """把直链下载到本地临时文件。"""
@@ -510,6 +778,7 @@ class PanLinkPlugin(Star):
             return {
                 "User-Agent": UA_PAN_DOWNLOAD,
                 "Cookie": str(self._cfg("baidu_cookie", "")),
+                "Referer": "https://pan.baidu.com/",
             }
         if pan == "aliyun":
             return {"Referer": "https://www.alipan.com/"}
@@ -530,17 +799,15 @@ class PanLinkPlugin(Star):
                 "Referer": "https://pan.xunlei.com/",
             }
         if pan == "quark":
-            cookie = str(self._cfg("quark_cookie", ""))
             return {
                 "User-Agent": UA_QUARK,
-                "Cookie": cookie,
+                "Cookie": str(self._cfg("quark_cookie", "")),
                 "Referer": "https://pan.quark.cn/",
             }
         if pan == "uc":
-            cookie = str(self._cfg("uc_cookie", ""))
             return {
                 "User-Agent": UA_UC,
-                "Cookie": cookie,
+                "Cookie": str(self._cfg("uc_cookie", "")),
                 "Referer": "https://drive.uc.cn/",
             }
         if pan == "123pan":
@@ -554,13 +821,23 @@ class PanLinkPlugin(Star):
     # 解析调度
     # ------------------------------------------------------------------
 
-    async def _resolve_files(
+    async def _open_share(
         self, pan: str, raw_url: str, share_id: str, pwd: str
-    ) -> list[PanFile]:
-        resolver = getattr(self, f"_list_{pan}", None)
-        if resolver is None:
+    ) -> tuple[dict[str, Any], list[PanFile], str]:
+        """打开分享，返回 (ctx, 根目录文件列表, 根目录引用)。"""
+        opener = getattr(self, f"_open_{pan}", None)
+        if opener is None:
             raise PanError(f"暂不支持的网盘：{pan}")
-        return await resolver(raw_url, share_id, pwd)
+        return await opener(raw_url, share_id, pwd)
+
+    async def _list_dir(
+        self, pan: str, ctx: dict[str, Any], dir_ref: str
+    ) -> list[PanFile]:
+        """列出指定目录。"""
+        lister = getattr(self, f"_list_{pan}", None)
+        if lister is None:
+            raise PanError(f"暂不支持的网盘：{pan}")
+        return await lister(ctx, dir_ref)
 
     async def _resolve_file_link(self, pan: str, item: PanFile) -> str:
         resolver = getattr(self, f"_link_{pan}", None)
@@ -572,7 +849,7 @@ class PanLinkPlugin(Star):
     # 百度网盘
     # ------------------------------------------------------------------
 
-    async def _list_baidu(self, raw_url: str, share_id: str, pwd: str) -> list[PanFile]:
+    async def _open_baidu(self, raw_url: str, share_id: str, pwd: str):
         cookie = str(self._cfg("baidu_cookie", ""))
         if not cookie:
             raise PanError("未配置百度网盘 Cookie（baidu_cookie）")
@@ -621,28 +898,40 @@ class PanLinkPlugin(Star):
                 if randsk:
                     verify_cookie = f"{cookie}; BDCLND={randsk}"
 
-        list_url = "https://pan.baidu.com/share/list"
-        params = {
-            "uk": share_uk,
+        ctx = {
             "shareid": shareid,
+            "uk": share_uk,
+            "surl": surl,
+            "bdstoken": bdstoken,
+            "cookie": verify_cookie,
+        }
+        files = await self._list_baidu(ctx, "/")
+        return ctx, files, "/"
+
+    async def _list_baidu(self, ctx: dict[str, Any], dir_ref: str) -> list[PanFile]:
+        surl = ctx.get("surl", "")
+        page_url = f"https://pan.baidu.com/s/1{surl}"
+        params = {
+            "uk": ctx.get("uk", ""),
+            "shareid": ctx.get("shareid", ""),
             "order": "other",
             "desc": "1",
             "showempty": "0",
             "web": "1",
             "page": "1",
             "num": "100",
-            "dir": "/",
+            "dir": dir_ref or "/",
             "t": str(int(time.time() * 1000)),
             "channel": "chunlei",
             "app_id": "250528",
             "clienttype": "0",
-            "bdstoken": bdstoken,
+            "bdstoken": ctx.get("bdstoken", ""),
             "shorturl": surl,
         }
         payload = await self._request(
             "GET",
-            list_url,
-            headers={"Cookie": verify_cookie, "Referer": page_url},
+            "https://pan.baidu.com/share/list",
+            headers={"Cookie": ctx.get("cookie", ""), "Referer": page_url},
             params=params,
         )
         if not isinstance(payload, dict):
@@ -655,19 +944,19 @@ class PanLinkPlugin(Star):
 
         files: list[PanFile] = []
         for entry in payload.get("list") or []:
+            is_dir = int(entry.get("isdir") or 0) == 1
+            name = entry.get("server_filename") or entry.get("filename") or "未命名"
+            child_ref = entry.get("path") or (
+                (dir_ref.rstrip("/") + "/" + name) if dir_ref else "/" + name
+            )
             files.append(
                 PanFile(
-                    name=entry.get("server_filename") or entry.get("filename") or "未命名",
+                    name=name,
                     size=int(entry.get("size") or 0),
-                    is_dir=int(entry.get("isdir") or 0) == 1,
+                    is_dir=is_dir,
                     file_id=str(entry.get("fs_id") or ""),
-                    extra={
-                        "shareid": shareid,
-                        "uk": share_uk,
-                        "surl": surl,
-                        "bdstoken": bdstoken,
-                        "cookie": verify_cookie,
-                    },
+                    dir_ref=child_ref if is_dir else "",
+                    extra=dict(ctx),
                 )
             )
         return files
@@ -776,16 +1065,21 @@ class PanLinkPlugin(Star):
         message = payload.get("message") if isinstance(payload, dict) else ""
         raise PanError(f"获取 share_token 失败：{message or '未知错误'}")
 
-    async def _list_aliyun(self, raw_url: str, share_id: str, pwd: str) -> list[PanFile]:
+    async def _open_aliyun(self, raw_url: str, share_id: str, pwd: str):
         share_token = await self._aliyun_share_token(share_id, pwd)
+        ctx = {"share_id": share_id, "share_token": share_token}
+        files = await self._list_aliyun(ctx, "root")
+        return ctx, files, "root"
+
+    async def _list_aliyun(self, ctx: dict[str, Any], dir_ref: str) -> list[PanFile]:
         payload = await self._request(
             "POST",
             "https://api.alipan.com/adrive/v2/file/list_share_file",
             headers={"Referer": "https://www.alipan.com/"},
             json_data={
-                "share_id": share_id,
-                "share_token": share_token,
-                "parent_file_id": "root",
+                "share_id": ctx.get("share_id", ""),
+                "share_token": ctx.get("share_token", ""),
+                "parent_file_id": dir_ref or "root",
                 "limit": 100,
                 "order_by": "name",
                 "order_direction": "ASC",
@@ -798,13 +1092,16 @@ class PanLinkPlugin(Star):
 
         files: list[PanFile] = []
         for entry in payload.get("items") or []:
+            is_dir = str(entry.get("type")) == "folder"
+            file_id = str(entry.get("file_id") or "")
             files.append(
                 PanFile(
                     name=entry.get("name") or "未命名",
                     size=int(entry.get("size") or 0),
-                    is_dir=str(entry.get("type")) == "folder",
-                    file_id=str(entry.get("file_id") or ""),
-                    extra={"share_id": share_id, "share_token": share_token},
+                    is_dir=is_dir,
+                    file_id=file_id,
+                    dir_ref=file_id if is_dir else "",
+                    extra=dict(ctx),
                 )
             )
         return files
@@ -849,15 +1146,22 @@ class PanLinkPlugin(Star):
             str(self._cfg("uc_cookie", "")),
         )
 
-    async def _list_quark_like(
-        self, pan: str, share_id: str, pwd: str
-    ) -> list[PanFile]:
+    async def _open_quark_like(self, pan: str, share_id: str, pwd: str):
         base, pr, ua, cookie = self._quark_like_conf(pan)
         if not cookie:
             raise PanError(f"未配置 {PAN_NAMES[pan]} Cookie")
+        required = ("__pus", "__puus") if pan == "quark" else ("__puus",)
+        if not self._cookie_has(cookie, *required):
+            raise PanError(
+                f"{PAN_NAMES[pan]} Cookie 缺少鉴权字段 {'/'.join(required)}，"
+                "请在浏览器 F12 → Network → Request Headers 中复制完整的 cookie 值"
+            )
 
-        headers = {"Cookie": cookie, "User-Agent": ua, "Referer": f"https://{self._host_of(pan)}/"}
-
+        headers = {
+            "Cookie": cookie,
+            "User-Agent": ua,
+            "Referer": f"https://{self._host_of(pan)}/",
+        }
         token_payload = await self._request(
             "POST",
             f"{base}/share/sharepage/token",
@@ -865,7 +1169,10 @@ class PanLinkPlugin(Star):
             params={"pr": pr, "fr": "pc"},
             json_data={"pwd_id": share_id, "passcode": pwd or ""},
         )
-        if not isinstance(token_payload, dict) or token_payload.get("code") not in (0, None):
+        if not isinstance(token_payload, dict) or token_payload.get("code") not in (
+            0,
+            None,
+        ):
             message = (
                 token_payload.get("message")
                 if isinstance(token_payload, dict)
@@ -876,6 +1183,27 @@ class PanLinkPlugin(Star):
         if not stoken:
             raise PanError("未获取到 share stoken")
 
+        ctx = {
+            "pwd_id": share_id,
+            "stoken": stoken,
+            "base": base,
+            "pr": pr,
+            "ua": ua,
+            "cookie": cookie,
+        }
+        files = await self._list_quark_like(pan, ctx, "0")
+        return ctx, files, "0"
+
+    async def _list_quark_like(
+        self, pan: str, ctx: dict[str, Any], dir_ref: str
+    ) -> list[PanFile]:
+        base = ctx.get("base") or self._quark_like_conf(pan)[0]
+        pr = ctx.get("pr") or self._quark_like_conf(pan)[1]
+        headers = {
+            "Cookie": ctx.get("cookie", ""),
+            "User-Agent": ctx.get("ua", ""),
+            "Referer": f"https://{self._host_of(pan)}/",
+        }
         detail = await self._request(
             "GET",
             f"{base}/share/sharepage/detail",
@@ -883,9 +1211,9 @@ class PanLinkPlugin(Star):
             params={
                 "pr": pr,
                 "fr": "pc",
-                "pwd_id": share_id,
-                "stoken": stoken,
-                "pdir_fid": "0",
+                "pwd_id": ctx.get("pwd_id", ""),
+                "stoken": ctx.get("stoken", ""),
+                "pdir_fid": dir_ref or "0",
                 "force": "0",
                 "_page": "1",
                 "_size": "100",
@@ -900,15 +1228,17 @@ class PanLinkPlugin(Star):
 
         files: list[PanFile] = []
         for entry in (detail.get("data") or {}).get("list") or []:
+            is_dir = entry.get("file") is False or entry.get("dir") is True
+            fid = str(entry.get("fid") or "")
             files.append(
                 PanFile(
                     name=entry.get("file_name") or "未命名",
                     size=int(entry.get("size") or 0),
-                    is_dir=entry.get("file") is False or entry.get("dir") is True,
-                    file_id=str(entry.get("fid") or ""),
+                    is_dir=is_dir,
+                    file_id=fid,
+                    dir_ref=fid if is_dir else "",
                     extra={
-                        "pwd_id": share_id,
-                        "stoken": stoken,
+                        **ctx,
                         "share_fid_token": entry.get("share_fid_token")
                         or entry.get("fid_token")
                         or "",
@@ -918,8 +1248,12 @@ class PanLinkPlugin(Star):
         return files
 
     async def _link_quark_like(self, pan: str, item: PanFile) -> str:
-        base, pr, ua, cookie = self._quark_like_conf(pan)
-        headers = {"Cookie": cookie, "User-Agent": ua}
+        base = item.extra.get("base") or self._quark_like_conf(pan)[0]
+        pr = item.extra.get("pr") or self._quark_like_conf(pan)[1]
+        headers = {
+            "Cookie": item.extra.get("cookie", ""),
+            "User-Agent": item.extra.get("ua", ""),
+        }
         payload = await self._request(
             "POST",
             f"{base}/share/sharepage/download",
@@ -943,14 +1277,20 @@ class PanLinkPlugin(Star):
             return str(rows[0]["download_url"])
         raise PanError("未返回下载链接")
 
-    async def _list_quark(self, raw_url: str, share_id: str, pwd: str) -> list[PanFile]:
-        return await self._list_quark_like("quark", share_id, pwd)
+    async def _open_quark(self, raw_url: str, share_id: str, pwd: str):
+        return await self._open_quark_like("quark", share_id, pwd)
+
+    async def _list_quark(self, ctx: dict[str, Any], dir_ref: str) -> list[PanFile]:
+        return await self._list_quark_like("quark", ctx, dir_ref)
 
     async def _link_quark(self, item: PanFile) -> str:
         return await self._link_quark_like("quark", item)
 
-    async def _list_uc(self, raw_url: str, share_id: str, pwd: str) -> list[PanFile]:
-        return await self._list_quark_like("uc", share_id, pwd)
+    async def _open_uc(self, raw_url: str, share_id: str, pwd: str):
+        return await self._open_quark_like("uc", share_id, pwd)
+
+    async def _list_uc(self, ctx: dict[str, Any], dir_ref: str) -> list[PanFile]:
+        return await self._list_quark_like("uc", ctx, dir_ref)
 
     async def _link_uc(self, item: PanFile) -> str:
         return await self._link_quark_like("uc", item)
@@ -966,28 +1306,35 @@ class PanLinkPlugin(Star):
     # 迅雷云盘
     # ------------------------------------------------------------------
 
-    async def _list_xunlei(self, raw_url: str, share_id: str, pwd: str) -> list[PanFile]:
+    async def _open_xunlei(self, raw_url: str, share_id: str, pwd: str):
         token = str(self._cfg("xunlei_access_token", ""))
         if not token:
             raise PanError("未配置迅雷 access_token（xunlei_access_token）")
+        ctx = {"share_id": share_id, "pass_code": pwd or ""}
+        files = await self._list_xunlei(ctx, "")
+        return ctx, files, ""
 
+    async def _list_xunlei(self, ctx: dict[str, Any], dir_ref: str) -> list[PanFile]:
+        token = str(self._cfg("xunlei_access_token", ""))
         headers = {
             "Authorization": f"Bearer {token}",
             "X-Captcha-Token": str(self._cfg("xunlei_captcha_token", "")),
             "X-Device-Id": str(self._cfg("xunlei_device_id", "")),
             "Referer": "https://pan.xunlei.com/",
         }
+        params = {
+            "share_id": ctx.get("share_id", ""),
+            "pass_code": ctx.get("pass_code", ""),
+            "limit": "100",
+            "with_audit": "true",
+        }
+        if dir_ref:
+            params["parent_id"] = dir_ref
         payload = await self._request(
             "GET",
             "https://api-pan.xunlei.com/drive/v1/share",
             headers=headers,
-            params={
-                "share_id": share_id,
-                "pass_code": pwd or "",
-                "limit": "100",
-                "parent_id": "",
-                "with_audit": "true",
-            },
+            params=params,
         )
         if not isinstance(payload, dict):
             raise PanError("文件列表响应异常")
@@ -998,13 +1345,16 @@ class PanLinkPlugin(Star):
 
         files: list[PanFile] = []
         for entry in payload.get("files") or []:
+            is_dir = str(entry.get("kind")) == "drive#folder"
+            fid = str(entry.get("id") or "")
             files.append(
                 PanFile(
                     name=entry.get("name") or "未命名",
                     size=int(entry.get("size") or 0),
-                    is_dir=str(entry.get("kind")) == "drive#folder",
-                    file_id=str(entry.get("id") or ""),
-                    extra={"share_id": share_id, "pass_code": pwd or ""},
+                    is_dir=is_dir,
+                    file_id=fid,
+                    dir_ref=fid if is_dir else "",
+                    extra=dict(ctx),
                 )
             )
         return files
@@ -1034,12 +1384,17 @@ class PanLinkPlugin(Star):
     # 123 云盘
     # ------------------------------------------------------------------
 
-    async def _list_123pan(self, raw_url: str, share_id: str, pwd: str) -> list[PanFile]:
-        cookie = str(self._cfg("pan123_cookie", ""))
+    async def _open_123pan(self, raw_url: str, share_id: str, pwd: str):
+        ctx = {"share_key": share_id, "share_pwd": pwd or ""}
+        files = await self._list_123pan(ctx, "0")
+        return ctx, files, "0"
+
+    async def _list_123pan(self, ctx: dict[str, Any], dir_ref: str) -> list[PanFile]:
         token = str(self._cfg("pan123_token", ""))
+        share_key = ctx.get("share_key", "")
         headers = {
-            "Cookie": cookie,
-            "Referer": f"https://www.123pan.com/s/{share_id}",
+            "Cookie": str(self._cfg("pan123_cookie", "")),
+            "Referer": f"https://www.123pan.com/s/{share_key}",
             "Platform": "android",
         }
         if token:
@@ -1054,8 +1409,9 @@ class PanLinkPlugin(Star):
                 "next": "1",
                 "orderBy": "share_id",
                 "orderDirection": "desc",
-                "shareKey": share_id,
-                "SharePwd": pwd or "",
+                "parentFileId": dir_ref or "0",
+                "shareKey": share_key,
+                "SharePwd": ctx.get("share_pwd", ""),
                 "Page": "1",
             },
         )
@@ -1070,15 +1426,17 @@ class PanLinkPlugin(Star):
         rows = info.get("InfoList") or info.get("infoList") or []
         files: list[PanFile] = []
         for entry in rows:
+            is_dir = int(entry.get("Type") or 0) != 0
+            fid = str(entry.get("FileId") or entry.get("fileId") or 0)
             files.append(
                 PanFile(
                     name=entry.get("FileName") or entry.get("fileName") or "未命名",
                     size=int(entry.get("Size") or entry.get("size") or 0),
-                    is_dir=int(entry.get("Type") or 0) != 0,
-                    file_id=str(entry.get("FileId") or entry.get("fileId") or ""),
+                    is_dir=is_dir,
+                    file_id=fid,
+                    dir_ref=fid if is_dir else "",
                     extra={
-                        "share_key": share_id,
-                        "share_pwd": pwd or "",
+                        **ctx,
                         "s3key": entry.get("S3KeyFlag") or entry.get("s3KeyFlag") or "",
                         "etag": entry.get("Etag") or entry.get("etag") or "",
                     },
@@ -1141,7 +1499,7 @@ class PanLinkPlugin(Star):
     # 中国移动云盘（139）
     # ------------------------------------------------------------------
 
-    async def _list_mcloud(self, raw_url: str, share_id: str, pwd: str) -> list[PanFile]:
+    async def _open_mcloud(self, raw_url: str, share_id: str, pwd: str):
         cookie = str(self._cfg("mcloud_cookie", ""))
         if not cookie:
             raise PanError("未配置移动云盘 Cookie（mcloud_cookie）")
@@ -1152,21 +1510,30 @@ class PanLinkPlugin(Star):
             headers={"Cookie": cookie, "Referer": "https://yun.139.com/"},
             json_data={"shareId": share_id, "sharePwd": pwd or ""},
         )
-        if not isinstance(info, dict) or str(info.get("code")) not in {"0", "200", "None"}:
+        if not isinstance(info, dict) or str(info.get("code")) not in {
+            "0",
+            "200",
+            "None",
+        }:
             message = info.get("message") if isinstance(info, dict) else "响应异常"
             raise PanError(f"获取分享信息失败：{message}")
 
         data = info.get("data") or {}
         ca_id = data.get("caId") or data.get("shareId") or share_id
+        ctx = {"share_id": share_id, "ca_id": ca_id}
+        files = await self._list_mcloud(ctx, "")
+        return ctx, files, ""
 
+    async def _list_mcloud(self, ctx: dict[str, Any], dir_ref: str) -> list[PanFile]:
+        cookie = str(self._cfg("mcloud_cookie", ""))
         listing = await self._request(
             "POST",
             "https://share-kd-njs.yun.139.com/hcy/share/getContentList",
             headers={"Cookie": cookie, "Referer": "https://yun.139.com/"},
             json_data={
-                "shareId": share_id,
-                "caId": ca_id,
-                "contentId": "",
+                "shareId": ctx.get("share_id", ""),
+                "caId": ctx.get("ca_id", ""),
+                "contentId": dir_ref or "",
                 "pageNum": 1,
                 "pageSize": 100,
                 "sortType": 1,
@@ -1176,26 +1543,21 @@ class PanLinkPlugin(Star):
         if not isinstance(listing, dict):
             raise PanError("文件列表响应异常")
         if str(listing.get("code")) not in {"0", "200", "None"}:
-            raise PanError(
-                f"获取文件列表失败：{listing.get('message', '未知错误')}"
-            )
+            raise PanError(f"获取文件列表失败：{listing.get('message', '未知错误')}")
 
         rows = ((listing.get("data") or {}).get("contentList")) or []
         files: list[PanFile] = []
         for entry in rows:
+            is_dir = bool(entry.get("dirEtag") or entry.get("caName"))
+            cid = str(entry.get("contentID") or entry.get("coId") or "")
             files.append(
                 PanFile(
                     name=entry.get("contentName") or entry.get("coName") or "未命名",
                     size=int(entry.get("contentSize") or entry.get("coSize") or 0),
-                    is_dir=bool(entry.get("dirEtag") or entry.get("caName")),
-                    file_id=str(entry.get("contentID") or entry.get("coId") or ""),
-                    extra={
-                        "share_id": share_id,
-                        "ca_id": ca_id,
-                        "catalog_id": entry.get("catalogID")
-                        or entry.get("parentCatalogID")
-                        or "",
-                    },
+                    is_dir=is_dir,
+                    file_id=cid,
+                    dir_ref=cid if is_dir else "",
+                    extra=dict(ctx),
                 )
             )
         return files
@@ -1228,7 +1590,7 @@ class PanLinkPlugin(Star):
     # 天翼云盘（189）
     # ------------------------------------------------------------------
 
-    async def _list_tcloud(self, raw_url: str, share_id: str, pwd: str) -> list[PanFile]:
+    async def _open_tcloud(self, raw_url: str, share_id: str, pwd: str):
         cookie = str(self._cfg("tcloud_cookie", ""))
         if not cookie:
             raise PanError("未配置天翼云盘 Cookie（tcloud_cookie）")
@@ -1243,9 +1605,7 @@ class PanLinkPlugin(Star):
             params={"shareCode": share_code},
         )
         if isinstance(info, dict) and info.get("errorCode"):
-            raise PanError(
-                str(info.get("errorMsg") or info.get("errorCode"))
-            )
+            raise PanError(str(info.get("errorMsg") or info.get("errorCode")))
 
         share_info = (info.get("shareInfo") if isinstance(info, dict) else {}) or {}
         share_id_real = str(share_info.get("shareId") or "")
@@ -1264,14 +1624,22 @@ class PanLinkPlugin(Star):
                     f"提取码校验失败：{check.get('errorMsg') or check.get('errorCode')}"
                 )
 
+        root_ref = str(share_info.get("fileId") or "")
+        ctx = {"share_id": share_id_real, "root": root_ref}
+        files = await self._list_tcloud(ctx, root_ref)
+        return ctx, files, root_ref
+
+    async def _list_tcloud(self, ctx: dict[str, Any], dir_ref: str) -> list[PanFile]:
+        cookie = str(self._cfg("tcloud_cookie", ""))
         listing = await self._request(
             "GET",
             "https://cloud.189.cn/api/portal/listFiles.action",
-            headers=headers,
+            headers={"Cookie": cookie, "Referer": "https://cloud.189.cn/"},
             params={
-                "shareId": share_id_real,
-                "fileId": share_info.get("fileId") or "",
-                "isFolder": "false",
+                "shareId": ctx.get("share_id", ""),
+                "fileId": dir_ref or ctx.get("root", ""),
+                # 顶层如果不是文件夹，isFolder 为 false 只列同级；是文件夹则列其内容
+                "isFolder": "true" if (dir_ref or ctx.get("root")) else "false",
                 "pageNum": "1",
                 "pageSize": "100",
                 "sortType": "1",
@@ -1281,22 +1649,24 @@ class PanLinkPlugin(Star):
         if not isinstance(listing, dict):
             raise PanError("文件列表响应异常")
         if listing.get("errorCode"):
-            raise PanError(
-                str(listing.get("errorMsg") or listing.get("errorCode"))
-            )
+            raise PanError(str(listing.get("errorMsg") or listing.get("errorCode")))
 
-        rows = (listing.get("fileList") or {}).get("file") or listing.get("fileList") or []
+        raw = listing.get("fileList") or {}
+        rows = raw.get("file") if isinstance(raw, dict) else raw
         files: list[PanFile] = []
-        for entry in rows:
+        for entry in rows or []:
             if not isinstance(entry, dict):
                 continue
+            is_dir = bool(entry.get("isFolder"))
+            fid = str(entry.get("id") or "")
             files.append(
                 PanFile(
                     name=entry.get("name") or "未命名",
                     size=int(entry.get("size") or 0),
-                    is_dir=bool(entry.get("isFolder")),
-                    file_id=str(entry.get("id") or ""),
-                    extra={"share_id": share_id_real},
+                    is_dir=is_dir,
+                    file_id=fid,
+                    dir_ref=fid if is_dir else "",
+                    extra=dict(ctx),
                 )
             )
         return files
