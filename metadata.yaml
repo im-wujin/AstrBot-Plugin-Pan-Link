@@ -1,0 +1,6 @@
+name: astrbot_plugin_pan_link
+display_name: 网盘直链解析
+desc: 识别聊天中的网盘分享链接，通过配置的 Cookie 解析直链，多文件时由会话选择，并通过 OneBot 发送文件
+version: v1.0.0
+author: WuJin
+repo: https://github.com/im-WuJin/AstrBot-Plugin-Pan-Link

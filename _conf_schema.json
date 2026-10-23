@@ -1,0 +1,141 @@
+{
+  "enabled_pans": {
+    "description": "启用的网盘",
+    "type": "list",
+    "default": [
+      "baidu",
+      "aliyun",
+      "mcloud",
+      "tcloud",
+      "xunlei",
+      "quark",
+      "uc",
+      "123pan"
+    ],
+    "items": {
+      "type": "string"
+    },
+    "options": [
+      "baidu",
+      "aliyun",
+      "mcloud",
+      "tcloud",
+      "xunlei",
+      "quark",
+      "uc",
+      "123pan"
+    ],
+    "hint": "可选：baidu（百度网盘）、aliyun（阿里云盘）、mcloud（移动云盘）、tcloud（天翼云盘）、xunlei（迅雷云盘）、quark（夸克网盘）、uc（UC网盘）、123pan（123云盘）"
+  },
+  "auto_send_single": {
+    "description": "分享中只有一个文件时直接发送",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后即使只有一个文件也需要用户回复序号确认"
+  },
+  "selection_timeout": {
+    "description": "等待用户选择文件的超时时间（秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "超时后本次会话的选择状态自动失效"
+  },
+  "max_file_size_mb": {
+    "description": "允许发送的最大文件大小（MB）",
+    "type": "int",
+    "default": 0,
+    "hint": "0 表示不限制。超过限制的文件将只返回直链，不下载发送"
+  },
+  "send_mode": {
+    "description": "文件发送方式",
+    "type": "string",
+    "default": "download",
+    "options": [
+      "download",
+      "url"
+    ],
+    "hint": "download：先下载到机器人本地再通过 OneBot 发送（兼容性最好）；url：直接把直链交给协议端上传"
+  },
+  "download_ua": {
+    "description": "下载文件时使用的 User-Agent",
+    "type": "string",
+    "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "hint": "部分网盘直链需要特定 UA，未单独配置时使用此值"
+  },
+  "request_timeout": {
+    "description": "网络请求超时时间（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "baidu_cookie": {
+    "description": "百度网盘 Cookie",
+    "type": "string",
+    "default": "",
+    "hint": "从 pan.baidu.com 浏览器开发者工具复制完整 Cookie，必须包含 BDUSS"
+  },
+  "baidu_access_token": {
+    "description": "百度网盘 access_token",
+    "type": "string",
+    "default": "",
+    "hint": "可选。用于生成带鉴权的 dlink，留空时使用 Cookie 直链"
+  },
+  "aliyun_refresh_token": {
+    "description": "阿里云盘 refresh_token",
+    "type": "string",
+    "default": "",
+    "hint": "从 alipan.com 网页 localStorage 的 token 中复制 refresh_token"
+  },
+  "mcloud_cookie": {
+    "description": "中国移动云盘 Cookie",
+    "type": "string",
+    "default": "",
+    "hint": "从 yun.139.com 或 caiyun.139.com 复制完整 Cookie"
+  },
+  "tcloud_cookie": {
+    "description": "天翼云盘 Cookie",
+    "type": "string",
+    "default": "",
+    "hint": "从 cloud.189.cn 复制完整 Cookie，需处于已登录状态"
+  },
+  "xunlei_access_token": {
+    "description": "迅雷云盘 access_token",
+    "type": "string",
+    "default": "",
+    "hint": "从 pan.xunlei.com 网页 localStorage 的 credentials_* 中取 access_token"
+  },
+  "xunlei_captcha_token": {
+    "description": "迅雷云盘 X-Captcha-Token",
+    "type": "string",
+    "default": "",
+    "hint": "从 pan.xunlei.com 网页 localStorage 的 captcha_* 中取 token，部分接口需要"
+  },
+  "xunlei_device_id": {
+    "description": "迅雷云盘 X-Device-Id",
+    "type": "string",
+    "default": "",
+    "hint": "从 pan.xunlei.com 网页 localStorage 的 deviceid 中提取 32 位设备号"
+  },
+  "quark_cookie": {
+    "description": "夸克网盘 Cookie",
+    "type": "string",
+    "default": "",
+    "hint": "从 pan.quark.cn 复制完整 Cookie，必须包含 __pus 等登录凭证"
+  },
+  "uc_cookie": {
+    "description": "UC网盘 Cookie",
+    "type": "string",
+    "default": "",
+    "hint": "从 drive.uc.cn 复制完整 Cookie"
+  },
+  "pan123_cookie": {
+    "description": "123云盘 Cookie",
+    "type": "string",
+    "default": "",
+    "hint": "从 www.123pan.com 复制完整 Cookie，需包含登录凭证"
+  },
+  "pan123_token": {
+    "description": "123云盘 authorToken",
+    "type": "string",
+    "default": "",
+    "hint": "从 123云盘网页 localStorage 的 authorToken 复制，用于获取直链"
+  }
+}
